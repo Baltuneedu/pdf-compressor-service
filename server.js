@@ -1,8 +1,12 @@
 
 // server.js
 // PDF compressor service: downloads from Supabase Storage, compresses with Ghostscript,
-// uploads back (overwrite optional), and updates pdf_storage.status via secure RPC.
-// Requires environment variables below to be set on the server (e.g., Vercel).
+// uploads back (overwrite optional), and updates pdf_storage directly using Service Role.
+// Environment variables required:
+//   PDF_COMPRESSOR_SECRET   — shared Bearer token expected by the DB trigger (Authorization header)
+//   SUPABASE_URL            — your Supabase project URL (e.g., https://xxxx.supabase.co)
+//   SUPABASE_SERVICE_ROLE   — your Supabase Service Role key
+//   GS_QUALITY              — optional Ghostscript preset: 'screen' | 'ebook' | 'printer' | 'prepress'
 
 import http from 'node:http';
 import { createClient } from '@supabase/supabase-js';
@@ -13,21 +17,13 @@ import path from 'node:path';
 import url from 'node:url';
 
 const PORT = process.env.PORT || 8080;
-
-// 🔐 Bearer token required by callers (e.g., your DB trigger or app)
 const SECRET = process.env.PDF_COMPRESSOR_SECRET || '';
-
-// Supabase project + service role (server-side only)
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || ''; // Service Role key
-
-// Ghostscript quality preset: 'screen' | 'ebook' | 'printer' | 'prepress'
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
 const GS_QUALITY = process.env.GS_QUALITY || 'ebook';
-
-// Temp working directory
 const TMPDIR = '/tmp';
 
-// Init Supabase client with Service Role (bypasses RLS on server)
+// Init Supabase client with Service Role (server-side only; bypasses RLS)
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
 });
@@ -46,7 +42,7 @@ async function runGhostscript(inPath, outPath, quality) {
     `-dPDFSETTINGS=/${quality}`,
     '-dNOPAUSE', '-dQUIET', '-dBATCH',
     `-sOutputFile=${outPath}`,
-    inPath
+    inPath,
   ];
   await new Promise((resolve, reject) => {
     const ps = spawn('gs', args);
@@ -57,16 +53,46 @@ async function runGhostscript(inPath, outPath, quality) {
   });
 }
 
-// 🔔 Secure RPC to flip pdf_storage.status by file_path (matches your Step 7 function)
-async function markPdfStatusByPath(filePath, status /* 'done'|'processing'|'error' */) {
-  const { error } = await supabase.rpc('update_pdf_status_by_path', {
-    p_file_path: filePath,
-    p_status: status
-  });
+// 🔔 Direct table update using Service Role (no RPC)
+async function markStatusByPath(filePath, status) {
+  const updates = { status, updated_at: new Date().toISOString() };
+  if (status === 'processing') {
+    updates.processing_started_at = new Date().toISOString();
+  } else if (status === 'done') {
+    updates.processing_finished_at = new Date().toISOString();
+  } else if (status === 'error') {
+    // leave room for explicit error messages set by caller
+  }
+
+  const { error } = await supabase
+    .from('pdf_storage')
+    .update(updates)
+    .eq('file_path', filePath);
+
   if (error) {
-    console.error(`RPC update_pdf_status_by_path failed for ${filePath} -> ${status}:`, error.message);
+    console.error(`DB update pdf_storage.status failed for ${filePath} -> ${status}:`, error.message);
   } else {
     console.log(`pdf_storage.status set to '${status}' for ${filePath}`);
+  }
+}
+
+// Optional: record compression stats in the same row
+async function writeCompressionStats(filePath, originalBytes, compressedBytes) {
+  const ratio = Number((compressedBytes / originalBytes).toFixed(3));
+  const { error } = await supabase
+    .from('pdf_storage')
+    .update({
+      compressed_size_bytes: compressedBytes,
+      compression_ratio: ratio,
+      overwrote: true,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('file_path', filePath);
+
+  if (error) {
+    console.error(`DB update compression stats failed for ${filePath}:`, error.message);
+  } else {
+    console.log(`Compression stats written for ${filePath}: ratio=${ratio}`);
   }
 }
 
@@ -75,7 +101,7 @@ async function handleCompress(req, res, body) {
   let filePathForStatus = null;
 
   try {
-    // Authorization
+    // Authorization (Bearer <PDF_COMPRESSOR_SECRET>)
     const auth = req.headers['authorization'] || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     if (!SECRET || token !== SECRET) return json(res, 401, { ok: false, error: 'unauthorized' });
@@ -84,19 +110,26 @@ async function handleCompress(req, res, body) {
     const { bucket, name, overwrite = true } = body || {};
     if (!bucket || !name) return json(res, 400, { ok: false, error: 'missing bucket or name' });
 
-    filePathForStatus = name; // e.g., "bf26781e-.../Lianke.pdf" (matches your table)
+    filePathForStatus = name; // e.g., "bf26781e-.../Erin T.pdf" (matches your table)
 
     // Mark processing immediately (nice for observability)
-    await markPdfStatusByPath(filePathForStatus, 'processing');
+    await markStatusByPath(filePathForStatus, 'processing');
 
     // Download original from Storage
     const dl = await supabase.storage.from(bucket).download(name);
     if (dl.error) {
-      await markPdfStatusByPath(filePathForStatus, 'error');
+      await supabase
+        .from('pdf_storage')
+        .update({
+          status: 'error',
+          processing_error: `download_failed: ${dl.error.message}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('file_path', filePathForStatus);
       return json(res, 500, { ok: false, error: 'download_failed', details: dl.error.message });
     }
 
-    // Paths in temp dir
+    // Temp paths
     const inBuf = Buffer.from(await dl.data.arrayBuffer());
     const id = randomUUID();
     const inPath = path.join(TMPDIR, `${id}-in.pdf`);
@@ -109,10 +142,19 @@ async function handleCompress(req, res, body) {
     // Upload compressed file (overwrite by default)
     const outBuf = await readFile(outPath);
     const up = await supabase.storage.from(bucket).upload(name, outBuf, {
-      upsert: overwrite, contentType: 'application/pdf', cacheControl: '3600'
+      upsert: overwrite,
+      contentType: 'application/pdf',
+      cacheControl: '3600',
     });
     if (up.error) {
-      await markPdfStatusByPath(filePathForStatus, 'error');
+      await supabase
+        .from('pdf_storage')
+        .update({
+          status: 'error',
+          processing_error: `upload_failed: ${up.error.message}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('file_path', filePathForStatus);
       return json(res, 500, { ok: false, error: 'upload_failed', details: up.error.message });
     }
 
@@ -122,8 +164,11 @@ async function handleCompress(req, res, body) {
     await unlink(inPath).catch(() => {});
     await unlink(outPath).catch(() => {});
 
-    // ✅ Flip to 'done' so OCR trigger runs
-    await markPdfStatusByPath(filePathForStatus, 'done');
+    // Write stats
+    await writeCompressionStats(filePathForStatus, origBytes, compBytes);
+
+    // ✅ Flip to 'done' so OCR trigger can run
+    await markStatusByPath(filePathForStatus, 'done');
 
     // Respond
     return json(res, 200, {
@@ -132,15 +177,22 @@ async function handleCompress(req, res, body) {
       original_bytes: origBytes,
       compressed_bytes: compBytes,
       ratio: Number((compBytes / origBytes).toFixed(3)),
-      quality: GS_QUALITY
+      quality: GS_QUALITY,
     });
-
   } catch (e) {
-    // Best effort error status
+    // Best effort: mark error
+    const msg = String(e?.message || e);
     if (filePathForStatus) {
-      await markPdfStatusByPath(filePathForStatus, 'error');
+      await supabase
+        .from('pdf_storage')
+        .update({
+          status: 'error',
+          processing_error: `internal_error: ${msg}`,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('file_path', filePathForStatus);
     }
-    return json(res, 500, { ok: false, error: 'internal', details: String(e?.message || e) });
+    return json(res, 500, { ok: false, error: 'internal', details: msg });
   }
 }
 
@@ -151,7 +203,10 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && pathname === '/compress') {
     let data = '';
-    req.on('data', (chunk) => { data += chunk.toString(); if (data.length > 1_000_000) req.destroy(); });
+    req.on('data', (chunk) => {
+      data += chunk.toString();
+      if (data.length > 1_000_000) req.destroy(); // basic protection
+    });
     req.on('end', async () => {
       let body = null;
       try { body = data ? JSON.parse(data) : null; } catch {}
