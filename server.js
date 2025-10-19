@@ -2,8 +2,8 @@
 // server.js
 // PDF compressor service: downloads from Supabase Storage, compresses with Ghostscript,
 // uploads back (overwrite optional), and updates pdf_storage directly using Service Role.
-// Environment variables required:
-//   PDF_COMPRESSOR_SECRET   — shared Bearer token expected by the DB trigger (Authorization header)
+// Environment variables required in Render:
+//   PDF_COMPRESSOR_SECRET   — shared token (Authorization header OR body token)
 //   SUPABASE_URL            — your Supabase project URL (e.g., https://xxxx.supabase.co)
 //   SUPABASE_SERVICE_ROLE   — your Supabase Service Role key
 //   GS_QUALITY              — optional Ghostscript preset: 'screen' | 'ebook' | 'printer' | 'prepress'
@@ -60,8 +60,6 @@ async function markStatusByPath(filePath, status) {
     updates.processing_started_at = new Date().toISOString();
   } else if (status === 'done') {
     updates.processing_finished_at = new Date().toISOString();
-  } else if (status === 'error') {
-    // leave room for explicit error messages set by caller
   }
 
   const { error } = await supabase
@@ -101,16 +99,21 @@ async function handleCompress(req, res, body) {
   let filePathForStatus = null;
 
   try {
-    // Authorization (Bearer <PDF_COMPRESSOR_SECRET>)
+    // Authorization: allow header OR body token
     const auth = req.headers['authorization'] || '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (!SECRET || token !== SECRET) return json(res, 401, { ok: false, error: 'unauthorized' });
+    const headerToken = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const bodyToken = (body && body.token) ? String(body.token) : '';
+    const authorized = SECRET && (headerToken === SECRET || bodyToken === SECRET);
+
+    if (!authorized) {
+      return json(res, 401, { ok: false, error: 'unauthorized' });
+    }
 
     // Input: bucket + name (name must equal pdf_storage.file_path)
     const { bucket, name, overwrite = true } = body || {};
     if (!bucket || !name) return json(res, 400, { ok: false, error: 'missing bucket or name' });
 
-    filePathForStatus = name; // e.g., "bf26781e-.../Erin T.pdf" (matches your table)
+    filePathForStatus = name; // e.g., "bf26781e-.../Eli.pdf" (matches your table)
 
     // Mark processing immediately (nice for observability)
     await markStatusByPath(filePathForStatus, 'processing');
@@ -164,10 +167,8 @@ async function handleCompress(req, res, body) {
     await unlink(inPath).catch(() => {});
     await unlink(outPath).catch(() => {});
 
-    // Write stats
+    // Write stats + flip to done
     await writeCompressionStats(filePathForStatus, origBytes, compBytes);
-
-    // ✅ Flip to 'done' so OCR trigger can run
     await markStatusByPath(filePathForStatus, 'done');
 
     // Respond
