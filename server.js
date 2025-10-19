@@ -1,222 +1,176 @@
-
 // server.js
-// PDF compressor service: downloads from Supabase Storage, compresses with Ghostscript,
-// uploads back (overwrite optional), and updates pdf_storage directly using Service Role.
-// Environment variables required in Render:
-//   PDF_COMPRESSOR_SECRET   — shared token (Authorization header OR body token)
-//   SUPABASE_URL            — your Supabase project URL (e.g., https://xxxx.supabase.co)
+// ---------------------------------------------------------------------------
+// PDF Compressor Microservice
+// ---------------------------------------------------------------------------
+// 1. Receives JSON POST from Supabase trigger (fn_on_pdf_insert_call_compression)
+// 2. Downloads PDF from Supabase Storage
+// 3. Compresses with Ghostscript
+// 4. Uploads the compressed file back (overwrite)
+// 5. Updates pdf_storage row status + compression stats
+//
+// Environment Variables required in Render Dashboard:
+//   PDF_COMPRESSOR_SECRET   — shared token (Authorization header OR JSON body)
+//   SUPABASE_URL            — your Supabase project URL (e.g. https://xxxx.supabase.co)
 //   SUPABASE_SERVICE_ROLE   — your Supabase Service Role key
-//   GS_QUALITY              — optional Ghostscript preset: 'screen' | 'ebook' | 'printer' | 'prepress'
+//   GS_QUALITY              — Ghostscript preset: screen | ebook | printer | prepress (default: ebook)
+// ---------------------------------------------------------------------------
 
-import http from 'node:http';
-import { createClient } from '@supabase/supabase-js';
-import { spawn } from 'node:child_process';
-import { writeFile, readFile, unlink, stat } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import path from 'node:path';
-import url from 'node:url';
+import http from "node:http";
+import { createClient } from "@supabase/supabase-js";
+import { spawn } from "node:child_process";
+import { writeFile, readFile, unlink, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
 
 const PORT = process.env.PORT || 8080;
-const SECRET = process.env.PDF_COMPRESSOR_SECRET || '';
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
-const GS_QUALITY = process.env.GS_QUALITY || 'ebook';
-const TMPDIR = '/tmp';
+const SECRET = process.env.PDF_COMPRESSOR_SECRET || "";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || "";
+const GS_QUALITY = process.env.GS_QUALITY || "ebook";
+const TMPDIR = "/tmp";
 
-// Init Supabase client with Service Role (server-side only; bypasses RLS)
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-});
-
-// Small JSON response helper
-function json(res, code, obj) {
-  res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
+if (!SECRET || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error("❌ Missing required environment variables.");
+  process.exit(1);
 }
 
-// Run Ghostscript to compress PDF
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+function json(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj, null, 2));
+}
+
 async function runGhostscript(inPath, outPath, quality) {
   const args = [
-    '-sDEVICE=pdfwrite',
-    '-dCompatibilityLevel=1.4',
+    "-sDEVICE=pdfwrite",
+    "-dCompatibilityLevel=1.4",
     `-dPDFSETTINGS=/${quality}`,
-    '-dNOPAUSE', '-dQUIET', '-dBATCH',
+    "-dNOPAUSE",
+    "-dQUIET",
+    "-dBATCH",
     `-sOutputFile=${outPath}`,
     inPath,
   ];
+
   await new Promise((resolve, reject) => {
-    const ps = spawn('gs', args);
-    let stderr = '';
-    ps.stderr?.on('data', (d) => (stderr += d.toString()));
-    ps.on('error', reject);
-    ps.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`gs exit ${code}: ${stderr}`))));
+    const ps = spawn("gs", args);
+    let stderr = "";
+    ps.stderr?.on("data", (d) => (stderr += d.toString()));
+    ps.on("error", reject);
+    ps.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Ghostscript exited ${code}: ${stderr}`));
+    });
   });
 }
 
-// 🔔 Direct table update using Service Role (no RPC)
-async function markStatusByPath(filePath, status) {
-  const updates = { status, updated_at: new Date().toISOString() };
-  if (status === 'processing') {
-    updates.processing_started_at = new Date().toISOString();
-  } else if (status === 'done') {
-    updates.processing_finished_at = new Date().toISOString();
-  }
+async function markStatusByPath(filePath, status, extra = {}) {
+  const updates = { status, updated_at: new Date().toISOString(), ...extra };
+  if (status === "processing") updates.processing_started_at = new Date().toISOString();
+  if (status === "done") updates.processing_finished_at = new Date().toISOString();
 
-  const { error } = await supabase
-    .from('pdf_storage')
-    .update(updates)
-    .eq('file_path', filePath);
-
-  if (error) {
-    console.error(`DB update pdf_storage.status failed for ${filePath} -> ${status}:`, error.message);
-  } else {
-    console.log(`pdf_storage.status set to '${status}' for ${filePath}`);
-  }
+  const { error } = await supabase.from("pdf_storage").update(updates).eq("file_path", filePath);
+  if (error) console.error("❌ DB status update failed:", error.message);
+  else console.log(`✅ pdf_storage.status → '${status}' (${filePath})`);
 }
 
-// Optional: record compression stats in the same row
 async function writeCompressionStats(filePath, originalBytes, compressedBytes) {
   const ratio = Number((compressedBytes / originalBytes).toFixed(3));
   const { error } = await supabase
-    .from('pdf_storage')
+    .from("pdf_storage")
     .update({
       compressed_size_bytes: compressedBytes,
       compression_ratio: ratio,
       overwrote: true,
       updated_at: new Date().toISOString(),
     })
-    .eq('file_path', filePath);
-
-  if (error) {
-    console.error(`DB update compression stats failed for ${filePath}:`, error.message);
-  } else {
-    console.log(`Compression stats written for ${filePath}: ratio=${ratio}`);
-  }
+    .eq("file_path", filePath);
+  if (error) console.error("❌ Compression stats update failed:", error.message);
+  else console.log(`📊 Compression ratio = ${ratio} (${filePath})`);
 }
 
-// Main compression handler
-async function handleCompress(req, res, body) {
-  let filePathForStatus = null;
+// ---------------------------------------------------------------------------
+// Core Handler
+// ---------------------------------------------------------------------------
+async function handleCompress(body) {
+  const token = body.token || "";
+  if (token !== SECRET) throw new Error("Invalid secret token");
+
+  const { bucket, file_name, file_path, file_url } = body;
+  if (!bucket || !file_name || !file_path) throw new Error("Missing bucket/file_path parameters");
+
+  const localIn = path.join(TMPDIR, `${randomUUID()}_${file_name}`);
+  const localOut = path.join(TMPDIR, `${randomUUID()}_compressed.pdf`);
+
+  console.log(`\n⚙️  Starting compression for: ${file_path}`);
+  await markStatusByPath(file_path, "processing");
 
   try {
-    // Authorization: allow header OR body token
-    const auth = req.headers['authorization'] || '';
-    const headerToken = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    const bodyToken = (body && body.token) ? String(body.token) : '';
-    const authorized = SECRET && (headerToken === SECRET || bodyToken === SECRET);
+    // Step 1: Download file from Supabase Storage
+    const { data, error: downloadErr } = await supabase.storage.from(bucket).download(file_path);
+    if (downloadErr) throw new Error(`Download failed: ${downloadErr.message}`);
+    const arrBuf = await data.arrayBuffer();
+    await writeFile(localIn, Buffer.from(arrBuf));
+    const { size: originalBytes } = await stat(localIn);
 
-    if (!authorized) {
-      return json(res, 401, { ok: false, error: 'unauthorized' });
-    }
+    console.log(`⬇️  Downloaded (${(originalBytes / 1e6).toFixed(2)} MB)`);
 
-    // Input: bucket + name (name must equal pdf_storage.file_path)
-    const { bucket, name, overwrite = true } = body || {};
-    if (!bucket || !name) return json(res, 400, { ok: false, error: 'missing bucket or name' });
+    // Step 2: Run Ghostscript compression
+    await runGhostscript(localIn, localOut, GS_QUALITY);
+    const { size: compressedBytes } = await stat(localOut);
+    console.log(`🗜️  Compressed (${(compressedBytes / 1e6).toFixed(2)} MB)`);
 
-    filePathForStatus = name; // e.g., "bf26781e-.../Eli.pdf" (matches your table)
-
-    // Mark processing immediately (nice for observability)
-    await markStatusByPath(filePathForStatus, 'processing');
-
-    // Download original from Storage
-    const dl = await supabase.storage.from(bucket).download(name);
-    if (dl.error) {
-      await supabase
-        .from('pdf_storage')
-        .update({
-          status: 'error',
-          processing_error: `download_failed: ${dl.error.message}`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('file_path', filePathForStatus);
-      return json(res, 500, { ok: false, error: 'download_failed', details: dl.error.message });
-    }
-
-    // Temp paths
-    const inBuf = Buffer.from(await dl.data.arrayBuffer());
-    const id = randomUUID();
-    const inPath = path.join(TMPDIR, `${id}-in.pdf`);
-    const outPath = path.join(TMPDIR, `${id}-out.pdf`);
-    await writeFile(inPath, inBuf);
-
-    // Compress
-    await runGhostscript(inPath, outPath, GS_QUALITY);
-
-    // Upload compressed file (overwrite by default)
-    const outBuf = await readFile(outPath);
-    const up = await supabase.storage.from(bucket).upload(name, outBuf, {
-      upsert: overwrite,
-      contentType: 'application/pdf',
-      cacheControl: '3600',
+    // Step 3: Upload compressed file (overwrite)
+    const buf = await readFile(localOut);
+    const { error: uploadErr } = await supabase.storage.from(bucket).upload(file_path, buf, {
+      upsert: true,
+      contentType: "application/pdf",
     });
-    if (up.error) {
-      await supabase
-        .from('pdf_storage')
-        .update({
-          status: 'error',
-          processing_error: `upload_failed: ${up.error.message}`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('file_path', filePathForStatus);
-      return json(res, 500, { ok: false, error: 'upload_failed', details: up.error.message });
-    }
+    if (uploadErr) throw new Error(`Upload failed: ${uploadErr.message}`);
+    console.log("⬆️  Uploaded compressed PDF back to Supabase.");
 
-    // Gather stats + cleanup
-    const origBytes = (await stat(inPath)).size;
-    const compBytes = (await stat(outPath)).size;
-    await unlink(inPath).catch(() => {});
-    await unlink(outPath).catch(() => {});
-
-    // Write stats + flip to done
-    await writeCompressionStats(filePathForStatus, origBytes, compBytes);
-    await markStatusByPath(filePathForStatus, 'done');
-
-    // Respond
-    return json(res, 200, {
-      ok: true,
-      overwrote: true,
-      original_bytes: origBytes,
-      compressed_bytes: compBytes,
-      ratio: Number((compBytes / origBytes).toFixed(3)),
-      quality: GS_QUALITY,
-    });
-  } catch (e) {
-    // Best effort: mark error
-    const msg = String(e?.message || e);
-    if (filePathForStatus) {
-      await supabase
-        .from('pdf_storage')
-        .update({
-          status: 'error',
-          processing_error: `internal_error: ${msg}`,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('file_path', filePathForStatus);
-    }
-    return json(res, 500, { ok: false, error: 'internal', details: msg });
+    // Step 4: Update DB row
+    await writeCompressionStats(file_path, originalBytes, compressedBytes);
+    await markStatusByPath(file_path, "done");
+  } catch (err) {
+    console.error("❌ Compression pipeline error:", err);
+    await markStatusByPath(file_path, "error", { processing_error: err.message });
+    throw err;
+  } finally {
+    await Promise.allSettled([unlink(localIn).catch(() => {}), unlink(localOut).catch(() => {})]);
   }
 }
 
-// HTTP server
+// ---------------------------------------------------------------------------
+// HTTP Server
+// ---------------------------------------------------------------------------
 const server = http.createServer(async (req, res) => {
-  const { pathname } = new url.URL(req.url, `http://${req.headers.host}`);
-  if (req.method === 'GET' && pathname === '/healthz') return json(res, 200, { ok: true });
-
-  if (req.method === 'POST' && pathname === '/compress') {
-    let data = '';
-    req.on('data', (chunk) => {
-      data += chunk.toString();
-      if (data.length > 1_000_000) req.destroy(); // basic protection
-    });
-    req.on('end', async () => {
-      let body = null;
-      try { body = data ? JSON.parse(data) : null; } catch {}
-      await handleCompress(req, res, body);
-    });
-    return;
+  if (req.method === "GET" && req.url === "/") {
+    return json(res, 200, { status: "ok", message: "PDF compressor service active" });
   }
 
-  json(res, 404, { ok: false, error: 'not_found' });
+  if (req.method === "POST" && req.url === "/compress") {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      await handleCompress(body);
+      return json(res, 200, { ok: true, message: "Compression complete" });
+    } catch (err) {
+      console.error("❌ POST /compress failed:", err);
+      return json(res, 500, { ok: false, error: err.message });
+    }
+  }
+
+  json(res, 404, { error: "Not found" });
 });
 
-server.listen(PORT, () => console.log(`pdf-compressor-service listening on :${PORT}`));
+server.listen(PORT, () => {
+  console.log(`🚀 PDF Compressor listening on port ${PORT}`);
+});
