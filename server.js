@@ -1,4 +1,3 @@
-
 // server.js
 import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
@@ -8,23 +7,13 @@ import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import url from 'node:url'
 
-/**
- * ENV
- *  - PORT (Render provides this)
- *  - PDF_COMPRESSOR_SECRET   (Bearer token expected from DB trigger)
- *  - SUPABASE_URL
- *  - SUPABASE_SERVICE_ROLE   (service role key)
- *  - GS_QUALITY              (baseline: screen|ebook|printer|prepress ; default: 'screen' for stronger compression)
- *  - TARGET_MAX_BYTES        (target output size; default: 900000 i.e., 0.9 MB)
- *  - MAX_INPUT_BYTES         (advisory; default: 4000000 i.e., 4 MB)
- */
 const PORT = process.env.PORT || 8080
 const SECRET = process.env.PDF_COMPRESSOR_SECRET || ''
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || ''
 const GS_QUALITY = (process.env.GS_QUALITY || 'screen').trim().toLowerCase()
-const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000) // 0.9 MB
-const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)  // 4 MB
+const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000)
+const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)
 const TMPDIR = '/tmp'
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
@@ -46,14 +35,6 @@ function json(res, code, obj) {
   res.end(JSON.stringify(obj))
 }
 
-/**
- * Build a gs args array for a given 'level'
- * Levels:
- *  - 'baseline'  : /<GS_QUALITY> only (defaults to /screen)
- *  - 'aggr72'    : /screen + explicit 72 dpi downsampling (color/gray/mono)
- *  - 'aggr50'    : more aggressive 50 dpi (color/gray), mono 120 dpi
- *  - 'ultra36'   : very aggressive 36 dpi (color/gray), mono 100 dpi
- */
 function buildGsArgs(level, inPath, outPath) {
   const base = [
     '-sDEVICE=pdfwrite',
@@ -74,21 +55,16 @@ function buildGsArgs(level, inPath, outPath) {
     '-dAutoFilterColorImages=false',
     '-dEncodeColorImages=true',
     '-dColorImageFilter=/DCTEncode',
-    // JPEG quality for color images (Ghostscript respects QFactor via image dicts,
-    // but this flag influences default compression; 60 is a good aggressive default)
     `-dJPEGQ=${jpegQuality}`,
-
     '-dDownsampleGrayImages=true',
     '-dGrayImageDownsampleType=/Bicubic',
     `-dGrayImageResolution=${grayDpi}`,
     '-dAutoFilterGrayImages=false',
     '-dEncodeGrayImages=true',
     '-dGrayImageFilter=/DCTEncode',
-
     '-dDownsampleMonoImages=true',
     '-dMonoImageDownsampleType=/Bicubic',
     `-dMonoImageResolution=${monoDpi}`,
-    // CCITT Group4 is generally best for monochrome – pdfwrite chooses efficiently
   ]
 
   switch (level) {
@@ -176,14 +152,6 @@ async function readJsonBody(req) {
   })
 }
 
-/**
- * Adaptive compression:
- * 1) baseline (GS_QUALITY, defaults to /screen)
- * 2) aggr72 (72 dpi)
- * 3) aggr50 (50 dpi)
- * 4) ultra36 (36 dpi)
- * Stops early as soon as TARGET_MAX_BYTES is reached and keeps the best result.
- */
 async function compressAdaptive(inPath, workDir) {
   const levels = ['baseline', 'aggr72', 'aggr50', 'ultra36']
   const results = []
@@ -203,32 +171,23 @@ async function compressAdaptive(inPath, workDir) {
       const outBytes = await fileBytes(outPath)
       results.push({ level, outPath, outBytes })
 
-      // Keep the smallest so far
       if (outBytes < bestBytes) {
-        // Replace best
         bestBytes = outBytes
         bestLevel = level
-
-        // To feed the next pass, use the latest output as the input
-        // Rename so we always have a stable "bestPath"
         const nextIn = path.join(workDir, `${randomUUID()}-best.pdf`)
         await rename(outPath, nextIn)
         bestPath = nextIn
       } else {
-        // Not better; remove output
         await unlink(outPath).catch(() => {})
       }
 
-      // Stop early if we hit target
       if (bestBytes <= TARGET_MAX_BYTES) {
         break
       }
     } catch (e) {
       console.warn(`[compress] ${level} failed:`, e.message)
-      // continue to next level
     }
   }
-
   return { bestPath, bestBytes, bestLevel, passUsed }
 }
 
@@ -253,7 +212,23 @@ async function handleCompress(req, res, body) {
       return json(res, 400, { ok: false, error: 'missing bucket or name' })
     }
 
-    console.log('INCOMING /compress', { bucket, objectName, overwrite })
+    // --- Check pdf_storage status before proceeding ---
+    const { data: storageRows, error: storageError } = await supabase
+      .from('pdf_storage')
+      .select('status')
+      .eq('file_path', objectName)
+      .limit(1)
+      .maybeSingle();
+
+    if (storageError) {
+      console.error('[compress] DB lookup error:', storageError.message);
+      return json(res, 500, { ok: false, error: 'db_lookup_failed', details: storageError.message });
+    }
+    if (!storageRows || storageRows.status === 'done') {
+      // Skip compression if already done
+      console.log(`[compress] Skipping ${objectName} (status is already 'done')`);
+      return json(res, 200, { ok: true, skipped: true, reason: "status already done" });
+    }
 
     // Download from Storage
     const dl = await supabase.storage.from(bucket).download(objectName)
@@ -263,22 +238,17 @@ async function handleCompress(req, res, body) {
     }
     const inBuf = Buffer.from(await dl.data.arrayBuffer())
 
-    // Optional advisory: log if input exceeds MAX_INPUT_BYTES
     if (inBuf.length > MAX_INPUT_BYTES) {
       console.log(`[advisory] input ${inBuf.length} > MAX_INPUT_BYTES ${MAX_INPUT_BYTES}`)
     }
 
-    // Temp files (working dir per request)
     const workDir = path.join(TMPDIR, `work-${randomUUID()}`)
-    // lightweight: we can just write into TMPDIR with unique names (no mkdir needed)
     const inPath = path.join(TMPDIR, `${randomUUID()}-in.pdf`)
     await writeFile(inPath, inBuf)
 
-    // Adaptive compression
     const originalBytes = inBuf.length
     const { bestPath, bestBytes, bestLevel, passUsed } = await compressAdaptive(inPath, TMPDIR)
 
-    // If we didn’t improve, don’t overwrite
     const shouldUpload = bestBytes < originalBytes
     if (!shouldUpload) {
       await unlink(inPath).catch(() => {})
@@ -295,13 +265,10 @@ async function handleCompress(req, res, body) {
       })
     }
 
-    // Upload back (overwrite original)
     const outBuf = await readFile(bestPath)
     const up = await supabase.storage
       .from(bucket)
       .upload(objectName, outBuf, { upsert: overwrite, contentType: 'application/pdf', cacheControl: '3600' })
-
-    // Cleanup temp files
     await unlink(inPath).catch(() => {})
     await unlink(bestPath).catch(() => {})
 
@@ -313,7 +280,6 @@ async function handleCompress(req, res, body) {
     const ratio = Number((bestBytes / originalBytes).toFixed(3))
     const hitTarget = bestBytes <= TARGET_MAX_BYTES
 
-    // Update your metadata row (by file_path = objectName)
     await updatePdfStorageRow(objectName, {
       compressedBytes: bestBytes,
       ratio,
@@ -348,12 +314,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/healthz') {
     return json(res, 200, { ok: true })
   }
-
   if (req.method === 'POST' && pathname === '/compress') {
     const body = await readJsonBody(req)
     return handleCompress(req, res, body)
   }
-
   return json(res, 404, { ok: false, error: 'not_found' })
 })
 
