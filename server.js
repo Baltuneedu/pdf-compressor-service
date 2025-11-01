@@ -1,10 +1,12 @@
 // api/compress.js
+// Compresses PDFs, updates Supabase metadata, and notifies OCR function when compression completes.
 
 import { createClient } from '@supabase/supabase-js'
 import { spawn } from 'child_process'
 import { promises as fs } from 'fs'
 import path from 'path'
 import crypto from 'crypto'
+import fetch from 'node-fetch'
 
 // ---- ENVIRONMENT VARIABLES ----
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
@@ -14,6 +16,7 @@ const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000)
 const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)
 const TMPDIR = '/tmp'
 const SECRET = process.env.PDF_COMPRESSOR_SECRET || ''
+const OCR_FUNCTION_URL = process.env.OCR_FUNCTION_URL || '' // 🔹 Add your deployed OCR edge function URL here
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -93,10 +96,13 @@ async function fileBytes(filePath) {
   return (await fs.stat(filePath)).size
 }
 
+/**
+ * Update pdf_storage row and trigger OCR notification if 'done'
+ */
 async function updatePdfStorageRow(filePath, metrics = {}) {
   const { compressedBytes, ratio, overwrote, hitTarget, passUsed } = metrics
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from('pdf_storage')
     .update({
       status: 'done',
@@ -108,9 +114,32 @@ async function updatePdfStorageRow(filePath, metrics = {}) {
       pass_used: Number.isInteger(passUsed) ? passUsed : null,
     })
     .eq('file_path', filePath)
+    .select('id, file_path, status')
+    .maybeSingle()
 
   if (error) {
     console.error('[updatePdfStorageRow] DB update failed:', error.message)
+    return
+  }
+
+  // 🔹 Notify OCR function after status = 'done'
+  if (data?.status === 'done' && OCR_FUNCTION_URL) {
+    try {
+      await fetch(OCR_FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE}`,
+        },
+        body: JSON.stringify({
+          id: data.id,
+          file_path: data.file_path,
+        }),
+      })
+      console.log(`[notify_ocr] Notified OCR function for ${data.file_path}`)
+    } catch (err) {
+      console.error('[notify_ocr] Error notifying OCR function:', err.message)
+    }
   }
 }
 
@@ -146,7 +175,7 @@ async function compressAdaptive(inPath, workDir) {
   return { bestPath, bestBytes, bestLevel, passUsed }
 }
 
-/** Main Vercel API handler */
+/** Main API Handler */
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ ok: false, error: 'Method not allowed' })
@@ -167,9 +196,7 @@ export default async function handler(req, res) {
       req.body ??
       (await new Promise((resolve) => {
         let data = ''
-        req.on('data', (chunk) => {
-          data += chunk.toString()
-        })
+        req.on('data', (chunk) => (data += chunk.toString()))
         req.on('end', () => {
           try {
             resolve(JSON.parse(data) || {})
@@ -222,18 +249,13 @@ export default async function handler(req, res) {
     if (inBuf.length < 524288) {
       console.log(`[compress] Skipping ${objectName}: file size ${inBuf.length} bytes (<0.5MB)`)
 
-      await supabase
-        .from('pdf_storage')
-        .update({
-          status: 'done',
-          compressed_size_bytes: inBuf.length,
-          compression_ratio: 1.0,
-          processing_finished_at: new Date().toISOString(),
-          overwrote: false,
-          hit_target: null,
-          pass_used: 0,
-        })
-        .eq('file_path', objectName)
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: inBuf.length,
+        ratio: 1.0,
+        overwrote: false,
+        hitTarget: null,
+        passUsed: 0,
+      })
 
       res.status(200).json({
         ok: true,
