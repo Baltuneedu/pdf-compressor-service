@@ -24,9 +24,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
 
 // ------- HELPERS -------
 function randomUUID() {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString('hex')
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex')
 }
 
 function buildGsArgs(level, inPath, outPath) {
@@ -85,9 +83,7 @@ async function runGhostscriptWithLevel(level, inPath, outPath) {
     ps.stderr?.on('data', (d) => (stderr += d.toString()))
     ps.on('error', reject)
     ps.on('close', (code) =>
-      code === 0
-        ? resolve()
-        : reject(new Error(`gs(${level}) exit ${code}: ${stderr}`))
+      code === 0 ? resolve() : reject(new Error(`gs(${level}) exit ${code}: ${stderr}`))
     )
   })
 }
@@ -141,6 +137,8 @@ async function updatePdfStorageRow(filePath, metrics = {}) {
       console.error('[notify_ocr] Error notifying OCR function:', err.message)
     }
   }
+
+  return { data }
 }
 
 async function compressAdaptive(inPath, workDir) {
@@ -157,6 +155,7 @@ async function compressAdaptive(inPath, workDir) {
     try {
       await runGhostscriptWithLevel(level, bestPath, outPath)
       const outBytes = await fileBytes(outPath)
+
       if (outBytes < bestBytes) {
         bestBytes = outBytes
         bestLevel = level
@@ -166,6 +165,7 @@ async function compressAdaptive(inPath, workDir) {
       } else {
         await fs.unlink(outPath).catch(() => {})
       }
+
       if (bestBytes <= TARGET_MAX_BYTES) break
     } catch (e) {
       console.warn(`[compress] ${level} failed:`, e.message)
@@ -249,13 +249,33 @@ export default async function handler(req, res) {
     if (inBuf.length < 524288) {
       console.log(`[compress] Skipping ${objectName}: file size ${inBuf.length} bytes (<0.5MB)`)
 
-      await updatePdfStorageRow(objectName, {
+      const dbRow = await updatePdfStorageRow(objectName, {
         compressedBytes: inBuf.length,
         ratio: 1.0,
         overwrote: false,
         hitTarget: null,
         passUsed: 0,
       })
+
+      // 🔹 Trigger OCR immediately
+      if (dbRow && dbRow.data?.id && OCR_FUNCTION_URL) {
+        try {
+          await fetch(OCR_FUNCTION_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${SUPABASE_SERVICE_ROLE}`,
+            },
+            body: JSON.stringify({
+              id: dbRow.data.id,
+              file_path: objectName,
+            }),
+          })
+          console.log(`[notify_ocr] Notified OCR function for ${objectName}`)
+        } catch (err) {
+          console.error('[notify_ocr] Error notifying OCR function:', err.message)
+        }
+      }
 
       res.status(200).json({
         ok: true,
@@ -267,6 +287,7 @@ export default async function handler(req, res) {
       return
     }
 
+    // --- Advisory for large input ---
     if (inBuf.length > MAX_INPUT_BYTES) {
       console.log(`[advisory] input ${inBuf.length} > MAX_INPUT_BYTES ${MAX_INPUT_BYTES}`)
     }
