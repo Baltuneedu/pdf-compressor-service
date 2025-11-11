@@ -1,38 +1,44 @@
 
 // server.js
-// Compresses PDFs, updates Supabase metadata, and notifies OCR function when compression completes.
-
+import http from 'node:http'
 import { createClient } from '@supabase/supabase-js'
 import { spawn } from 'child_process'
-import { promises as fs } from 'fs'
-import path from 'path'
-import crypto from 'crypto'
+import { writeFile, readFile, unlink, stat, rename } from 'node:fs/promises'
+import path from 'node:path'
+import crypto from 'node:crypto'
+import url from 'node:url'
 import fetch from 'node-fetch'
 
 // ---- ENVIRONMENT VARIABLES ----
+const PORT = process.env.PORT || 8080
+const SECRET = process.env.PDF_COMPRESSOR_SECRET || ''
 const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || ''
 const GS_QUALITY = (process.env.GS_QUALITY || 'screen').trim().toLowerCase()
 const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000)
 const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)
 const TMPDIR = '/tmp'
-const SECRET = process.env.PDF_COMPRESSOR_SECRET || ''
 const OCR_FUNCTION_URL = process.env.OCR_FUNCTION_URL || ''
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
 })
 
-// ------- HELPERS -------
+// ---- Helpers ----
 function randomUUID() {
   return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex')
+}
+
+function json(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(obj))
 }
 
 function buildGsArgs(level, inPath, outPath) {
   const base = [
     '-sDEVICE=pdfwrite',
     '-dCompatibilityLevel=1.4',
-    `-dPDFSETTINGS=/${GS_QUALITY || 'screen'}`,
+    `-dPDFSETTINGS=/${GS_QUALITY}`,
     '-dNOPAUSE',
     '-dQUIET',
     '-dBATCH',
@@ -86,24 +92,23 @@ async function runGhostscriptWithLevel(level, inPath, outPath) {
 }
 
 async function fileBytes(filePath) {
-  return (await fs.stat(filePath)).size
+  return (await stat(filePath)).size
 }
 
-// ---- Update Database + Notify OCR ----
 async function updatePdfStorageRow(filePath, metrics = {}) {
   const { compressedBytes, ratio, overwrote, hitTarget, passUsed } = metrics
-  console.log(`[db] Updating row for ${filePath}...`)
+  console.log(`[db] Updating pdf_storage for ${filePath}...`)
 
   const { data, error } = await supabase
     .from('pdf_storage')
     .update({
       status: 'done',
-      compressed_size_bytes: typeof compressedBytes === 'number' ? compressedBytes : null,
-      compression_ratio: typeof ratio === 'number' ? ratio : null,
+      compressed_size_bytes: compressedBytes,
+      compression_ratio: ratio,
       processing_finished_at: new Date().toISOString(),
-      overwrote: typeof overwrote === 'boolean' ? overwrote : true,
-      hit_target: typeof hitTarget === 'boolean' ? hitTarget : null,
-      pass_used: Number.isInteger(passUsed) ? passUsed : null,
+      overwrote,
+      hit_target: hitTarget,
+      pass_used: passUsed,
     })
     .eq('file_path', filePath)
     .select('id, file_path, status')
@@ -114,10 +119,10 @@ async function updatePdfStorageRow(filePath, metrics = {}) {
     return
   }
 
-  console.log(`[db] Updated pdf_storage for ${filePath}, status = done`)
+  console.log(`[db] Updated status = done for ${filePath}`)
 
-  // ---- Notify OCR ----
-  if (data?.status === 'done' && OCR_FUNCTION_URL) {
+  // Notify OCR function
+  if (OCR_FUNCTION_URL && data?.status === 'done') {
     try {
       console.log(`[notify_ocr] Sending POST to OCR for ${data.file_path}`)
       await fetch(OCR_FUNCTION_URL, {
@@ -128,16 +133,13 @@ async function updatePdfStorageRow(filePath, metrics = {}) {
         },
         body: JSON.stringify({ id: data.id, file_path: data.file_path }),
       })
-      console.log(`[notify_ocr] ✅ OCR function notified for ${data.file_path}`)
+      console.log(`[notify_ocr] ✅ OCR notified for ${data.file_path}`)
     } catch (err) {
       console.error('[notify_ocr] ❌ Error notifying OCR:', err.message)
     }
   }
-
-  return { data }
 }
 
-// ---- Compression Routine ----
 async function compressAdaptive(inPath, workDir) {
   const levels = ['baseline', 'aggr72', 'aggr50', 'ultra36']
   let bestPath = inPath
@@ -158,10 +160,10 @@ async function compressAdaptive(inPath, workDir) {
         bestBytes = outBytes
         bestLevel = level
         const nextIn = path.join(workDir, `${randomUUID()}-best.pdf`)
-        await fs.rename(outPath, nextIn)
+        await rename(outPath, nextIn)
         bestPath = nextIn
       } else {
-        await fs.unlink(outPath).catch(() => {})
+        await unlink(outPath).catch(() => {})
       }
 
       if (bestBytes <= TARGET_MAX_BYTES) break
@@ -174,37 +176,15 @@ async function compressAdaptive(inPath, workDir) {
   return { bestPath, bestBytes, bestLevel, passUsed }
 }
 
-// ---- MAIN HANDLER ----
-export default async function handler(req, res) {
-  console.log(`[api/server] ${req.method} /api/server called`)
-
-  if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: 'Method not allowed' })
-    return
-  }
-
+// ---- Main Handler ----
+async function handleCompress(req, res, body) {
   try {
     const auth = req.headers['authorization'] || ''
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
     if (!SECRET || token !== SECRET) {
       console.warn('[auth] Unauthorized request')
-      res.status(401).json({ ok: false, error: 'unauthorized' })
-      return
+      return json(res, 401, { ok: false, error: 'unauthorized' })
     }
-
-    const body =
-      req.body ??
-      (await new Promise((resolve) => {
-        let data = ''
-        req.on('data', (chunk) => (data += chunk.toString()))
-        req.on('end', () => {
-          try {
-            resolve(JSON.parse(data) || {})
-          } catch {
-            resolve({})
-          }
-        })
-      }))
 
     const bucket = body?.bucket
     const objectName = body?.name ?? body?.path
@@ -212,35 +192,26 @@ export default async function handler(req, res) {
     console.log(`[input] Bucket: ${bucket}, File: ${objectName}`)
 
     if (!bucket || !objectName) {
-      res.status(400).json({ ok: false, error: 'missing bucket or name' })
-      return
+      return json(res, 400, { ok: false, error: 'missing bucket or name' })
     }
 
-    const { data: storageRows, error: storageError } = await supabase
+    const { data: storageRows } = await supabase
       .from('pdf_storage')
       .select('status')
       .eq('file_path', objectName)
       .limit(1)
       .maybeSingle()
 
-    if (storageError) {
-      console.error('[db] Lookup error:', storageError.message)
-      res.status(500).json({ ok: false, error: 'db_lookup_failed', details: storageError.message })
-      return
-    }
-
     if (!storageRows || storageRows.status === 'done') {
       console.log(`[compress] Skipping ${objectName} (already done)`)
-      res.status(200).json({ ok: true, skipped: true, reason: 'status already done' })
-      return
+      return json(res, 200, { ok: true, skipped: true })
     }
 
     console.log(`[download] Fetching ${objectName} from bucket ${bucket}`)
     const dl = await supabase.storage.from(bucket).download(objectName)
     if (dl.error) {
       console.error('[download] Error:', dl.error.message)
-      res.status(500).json({ ok: false, error: 'download_failed', details: dl.error.message })
-      return
+      return json(res, 500, { ok: false, error: 'download_failed' })
     }
 
     const inBuf = Buffer.from(await dl.data.arrayBuffer())
@@ -255,63 +226,35 @@ export default async function handler(req, res) {
         hitTarget: null,
         passUsed: 0,
       })
-
-      res.status(200).json({
-        ok: true,
-        skipped: true,
-        reason: 'file under 0.5MB',
-        original_bytes: inBuf.length,
-        compressed_bytes: inBuf.length,
-      })
-      return
+      return json(res, 200, { ok: true, skipped: true })
     }
 
-    if (inBuf.length > MAX_INPUT_BYTES) {
-      console.log(`[advisory] File size ${inBuf.length} > MAX_INPUT_BYTES ${MAX_INPUT_BYTES}`)
-    }
-
-    const workDir = TMPDIR
-    const inPath = path.join(workDir, `${randomUUID()}-in.pdf`)
-    await fs.writeFile(inPath, inBuf)
+    const inPath = path.join(TMPDIR, `${randomUUID()}-in.pdf`)
+    await writeFile(inPath, inBuf)
     console.log(`[compress] Starting compression for ${objectName}`)
 
     const originalBytes = inBuf.length
-    const { bestPath, bestBytes, bestLevel, passUsed } = await compressAdaptive(inPath, workDir)
+    const { bestPath, bestBytes, bestLevel, passUsed } = await compressAdaptive(inPath, TMPDIR)
 
-    const shouldUpload = bestBytes < originalBytes
-    if (!shouldUpload) {
-      console.log(`[compress] No improvement for ${objectName}, skipping upload`)
-      res.status(200).json({
-        ok: true,
-        overwrote: false,
-        original_bytes: originalBytes,
-        compressed_bytes: originalBytes,
-        ratio: 1.0,
-        quality: `${GS_QUALITY} (no improvement)`,
-        pass_used: 0,
-        hit_target: originalBytes <= TARGET_MAX_BYTES,
-        target_bytes: TARGET_MAX_BYTES,
-      })
-      return
+    if (bestBytes >= originalBytes) {
+      console.log(`[compress] No improvement for ${objectName}`)
+      return json(res, 200, { ok: true, overwrote: false })
     }
 
-    const outBuf = await fs.readFile(bestPath)
+    const outBuf = await readFile(bestPath)
     console.log(`[upload] Uploading compressed file ${objectName}`)
-    const up = await supabase.storage
-      .from(bucket)
-      .upload(objectName, outBuf, {
-        upsert: overwrite,
-        contentType: 'application/pdf',
-        cacheControl: '3600',
-      })
+    const up = await supabase.storage.from(bucket).upload(objectName, outBuf, {
+      upsert: overwrite,
+      contentType: 'application/pdf',
+      cacheControl: '3600',
+    })
 
-    await fs.unlink(inPath).catch(() => {})
-    await fs.unlink(bestPath).catch(() => {})
+    await unlink(inPath).catch(() => {})
+    await unlink(bestPath).catch(() => {})
 
     if (up.error) {
       console.error('[upload] Error:', up.error.message)
-      res.status(500).json({ ok: false, error: 'upload_failed', details: up.error.message })
-      return
+      return json(res, 500, { ok: false, error: 'upload_failed' })
     }
 
     const ratio = Number((bestBytes / originalBytes).toFixed(3))
@@ -327,7 +270,7 @@ export default async function handler(req, res) {
       passUsed,
     })
 
-    res.status(200).json({
+    return json(res, 200, {
       ok: true,
       overwrote: true,
       original_bytes: originalBytes,
@@ -340,6 +283,34 @@ export default async function handler(req, res) {
     })
   } catch (e) {
     console.error('[compress] internal error:', e)
-    res.status(500).json({ ok: false, error: 'internal', details: String(e?.message || e) })
+    return json(res, 500, { ok: false, error: 'internal', details: String(e?.message || e) })
   }
 }
+
+// ---- HTTP Server ----
+const server = http.createServer(async (req, res) => {
+  const { pathname } = new url.URL(req.url, `http://${req.headers.host}`)
+
+  if (req.method === 'GET' && pathname === '/healthz') {
+    return json(res, 200, { ok: true })
+  }
+
+  if (req.method === 'POST' && pathname === '/compress') {
+    const body = await new Promise((resolve) => {
+      let data = ''
+      req.on('data', (chunk) => (data += chunk.toString()))
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data) || {})
+        } catch {
+          resolve({})
+        }
+      })
+    })
+    return handleCompress(req, res, body)
+  }
+
+  return json(res, 404, { ok: false, error: 'not_found' })
+})
+
+server.listen(PORT, () => console.log(`pdf-compressor-service listening on :${PORT}`))
