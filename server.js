@@ -1,6 +1,6 @@
-// api/server.js
+
+// server.js
 // Compresses PDFs, updates Supabase metadata, and notifies OCR function when compression completes.
-// Includes detailed console logging for Vercel Runtime Logs.
 
 import { createClient } from '@supabase/supabase-js'
 import { spawn } from 'child_process'
@@ -17,7 +17,7 @@ const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000)
 const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)
 const TMPDIR = '/tmp'
 const SECRET = process.env.PDF_COMPRESSOR_SECRET || ''
-const OCR_FUNCTION_URL = process.env.OCR_FUNCTION_URL || '' // 🔹 Deployed OCR edge function URL
+const OCR_FUNCTION_URL = process.env.OCR_FUNCTION_URL || ''
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
@@ -184,7 +184,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    // --- Auth ---
     const auth = req.headers['authorization'] || ''
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
     if (!SECRET || token !== SECRET) {
@@ -193,7 +192,6 @@ export default async function handler(req, res) {
       return
     }
 
-    // --- Parse body ---
     const body =
       req.body ??
       (await new Promise((resolve) => {
@@ -218,7 +216,6 @@ export default async function handler(req, res) {
       return
     }
 
-    // --- Check status ---
     const { data: storageRows, error: storageError } = await supabase
       .from('pdf_storage')
       .select('status')
@@ -238,7 +235,6 @@ export default async function handler(req, res) {
       return
     }
 
-    // --- Download from Supabase ---
     console.log(`[download] Fetching ${objectName} from bucket ${bucket}`)
     const dl = await supabase.storage.from(bucket).download(objectName)
     if (dl.error) {
@@ -250,10 +246,9 @@ export default async function handler(req, res) {
     const inBuf = Buffer.from(await dl.data.arrayBuffer())
     console.log(`[download] File size: ${inBuf.length} bytes`)
 
-    // --- Skip small files ---
     if (inBuf.length < 524288) {
       console.log(`[compress] Skipping ${objectName}: under 0.5MB`)
-      const dbRow = await updatePdfStorageRow(objectName, {
+      await updatePdfStorageRow(objectName, {
         compressedBytes: inBuf.length,
         ratio: 1.0,
         overwrote: false,
@@ -275,7 +270,6 @@ export default async function handler(req, res) {
       console.log(`[advisory] File size ${inBuf.length} > MAX_INPUT_BYTES ${MAX_INPUT_BYTES}`)
     }
 
-    // --- Compress ---
     const workDir = TMPDIR
     const inPath = path.join(workDir, `${randomUUID()}-in.pdf`)
     await fs.writeFile(inPath, inBuf)
@@ -284,7 +278,6 @@ export default async function handler(req, res) {
     const originalBytes = inBuf.length
     const { bestPath, bestBytes, bestLevel, passUsed } = await compressAdaptive(inPath, workDir)
 
-    // --- Upload compressed file ---
     const shouldUpload = bestBytes < originalBytes
     if (!shouldUpload) {
       console.log(`[compress] No improvement for ${objectName}, skipping upload`)
