@@ -16,6 +16,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || ''
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || ''
 const GS_QUALITY = (process.env.GS_QUALITY || 'screen').trim().toLowerCase()
 const TARGET_MAX_BYTES = Number(process.env.TARGET_MAX_BYTES || 900000)
+// Optional: cap for inputs you want to process
 const MAX_INPUT_BYTES = Number(process.env.MAX_INPUT_BYTES || 4000000)
 const TMPDIR = '/tmp'
 const OCR_FUNCTION_URL = process.env.OCR_FUNCTION_URL || ''
@@ -38,7 +39,7 @@ function buildGsArgs(level, inPath, outPath) {
   const base = [
     '-sDEVICE=pdfwrite',
     '-dCompatibilityLevel=1.4',
-    `-dPDFSETTINGS=/${GS_QUALITY}`,
+    `-dPDFSETTINGS=/${GS_QUALITY}`, // global quality baseline
     '-dNOPAUSE',
     '-dQUIET',
     '-dBATCH',
@@ -70,10 +71,10 @@ function buildGsArgs(level, inPath, outPath) {
 
   switch (level) {
     case 'baseline': return base
-    case 'aggr72': return [...base, ...downsample(72, 72, 200, 55)]
-    case 'aggr50': return [...base, ...downsample(50, 50, 120, 45)]
-    case 'ultra36': return [...base, ...downsample(36, 36, 100, 35)]
-    default: return base
+    case 'aggr72':   return [...base, ...downsample(72, 72, 200, 55)]
+    case 'aggr50':   return [...base, ...downsample(50, 50, 120, 45)]
+    case 'ultra36':  return [...base, ...downsample(36, 36, 100, 35)]
+    default:         return base
   }
 }
 
@@ -95,14 +96,14 @@ async function fileBytes(filePath) {
   return (await stat(filePath)).size
 }
 
-async function updatePdfStorageRow(filePath, metrics = {}) {
+async function updatePdfStorageRow(filePath, metrics = {}, status = 'done') {
   const { compressedBytes, ratio, overwrote, hitTarget, passUsed } = metrics
   console.log(`[db] Updating pdf_storage for ${filePath}...`)
 
   const { data, error } = await supabase
     .from('pdf_storage')
     .update({
-      status: 'done',
+      status,
       compressed_size_bytes: compressedBytes,
       compression_ratio: ratio,
       processing_finished_at: new Date().toISOString(),
@@ -119,9 +120,9 @@ async function updatePdfStorageRow(filePath, metrics = {}) {
     return
   }
 
-  console.log(`[db] Updated status = done for ${filePath}`)
+  console.log(`[db] Updated status = ${status} for ${filePath}`)
 
-  // Notify OCR function
+  // Notify OCR function when processing reaches 'done'
   if (OCR_FUNCTION_URL && data?.status === 'done') {
     try {
       console.log(`[notify_ocr] Sending POST to OCR for ${data.file_path}`)
@@ -178,6 +179,11 @@ async function compressAdaptive(inPath, workDir) {
 
 // ---- Main Handler ----
 async function handleCompress(req, res, body) {
+  let objectName = null
+  let bucket = null
+  let inPath = null
+  let bestPath = null
+
   try {
     const auth = req.headers['authorization'] || ''
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
@@ -186,8 +192,8 @@ async function handleCompress(req, res, body) {
       return json(res, 401, { ok: false, error: 'unauthorized' })
     }
 
-    const bucket = body?.bucket
-    const objectName = body?.name ?? body?.path
+    bucket = body?.bucket
+    objectName = body?.name ?? body?.path
     const overwrite = body?.overwrite !== false
     console.log(`[input] Bucket: ${bucket}, File: ${objectName}`)
 
@@ -195,14 +201,19 @@ async function handleCompress(req, res, body) {
       return json(res, 400, { ok: false, error: 'missing bucket or name' })
     }
 
-    const { data: storageRows } = await supabase
+    // If you store a row per file_path, check status to avoid duplicate work
+    const { data: storageRow, error: storageErr } = await supabase
       .from('pdf_storage')
       .select('status')
       .eq('file_path', objectName)
       .limit(1)
       .maybeSingle()
 
-    if (!storageRows || storageRows.status === 'done') {
+    if (storageErr) {
+      console.warn('[db] Read error (continuing):', storageErr.message)
+    }
+
+    if (storageRow?.status === 'done') {
       console.log(`[compress] Skipping ${objectName} (already done)`)
       return json(res, 200, { ok: true, skipped: true })
     }
@@ -211,12 +222,30 @@ async function handleCompress(req, res, body) {
     const dl = await supabase.storage.from(bucket).download(objectName)
     if (dl.error) {
       console.error('[download] Error:', dl.error.message)
+      // Mark failed so row doesn’t sit as pending
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: null, ratio: null, overwrote: false, hitTarget: null, passUsed: 0,
+      }, 'failed')
       return json(res, 500, { ok: false, error: 'download_failed' })
     }
 
     const inBuf = Buffer.from(await dl.data.arrayBuffer())
     console.log(`[download] File size: ${inBuf.length} bytes`)
 
+    // Optional guard against extremely large inputs, if desired
+    if (inBuf.length > MAX_INPUT_BYTES) {
+      console.log(`[compress] Skipping ${objectName}: exceeds max input size (${MAX_INPUT_BYTES})`)
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: inBuf.length,
+        ratio: 1.0,
+        overwrote: false,
+        hitTarget: null,
+        passUsed: 0,
+      }, 'failed')
+      return json(res, 413, { ok: false, error: 'input_too_large' })
+    }
+
+    // If under 0.5MB, mark done immediately (your current behavior)
     if (inBuf.length < 524288) {
       console.log(`[compress] Skipping ${objectName}: under 0.5MB`)
       await updatePdfStorageRow(objectName, {
@@ -225,19 +254,34 @@ async function handleCompress(req, res, body) {
         overwrote: false,
         hitTarget: null,
         passUsed: 0,
-      })
+      }, 'done')
       return json(res, 200, { ok: true, skipped: true })
     }
 
-    const inPath = path.join(TMPDIR, `${randomUUID()}-in.pdf`)
+    inPath = path.join(TMPDIR, `${randomUUID()}-in.pdf`)
     await writeFile(inPath, inBuf)
     console.log(`[compress] Starting compression for ${objectName}`)
 
     const originalBytes = inBuf.length
-    const { bestPath, bestBytes, bestLevel, passUsed } = await compressAdaptive(inPath, TMPDIR)
+    const result = await compressAdaptive(inPath, TMPDIR)
+    bestPath = result.bestPath
+    const { bestBytes, bestLevel, passUsed } = result
 
     if (bestBytes >= originalBytes) {
       console.log(`[compress] No improvement for ${objectName}`)
+      // ✅ Mark terminal state: done (no change)
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: originalBytes,
+        ratio: 1.0,
+        overwrote: false,
+        hitTarget: originalBytes <= TARGET_MAX_BYTES,
+        passUsed,
+      }, 'done')
+
+      // Cleanup
+      await unlink(inPath).catch(() => {})
+      if (bestPath && bestPath !== inPath) await unlink(bestPath).catch(() => {})
+
       return json(res, 200, { ok: true, overwrote: false })
     }
 
@@ -249,11 +293,21 @@ async function handleCompress(req, res, body) {
       cacheControl: '3600',
     })
 
+    // Cleanup temp files
     await unlink(inPath).catch(() => {})
     await unlink(bestPath).catch(() => {})
 
     if (up.error) {
       console.error('[upload] Error:', up.error.message)
+      // Mark failed so row doesn’t sit as pending
+      const ratioFail = Number((bestBytes / originalBytes).toFixed(3))
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: bestBytes,
+        ratio: ratioFail,
+        overwrote: false,
+        hitTarget: bestBytes <= TARGET_MAX_BYTES,
+        passUsed,
+      }, 'failed')
       return json(res, 500, { ok: false, error: 'upload_failed' })
     }
 
@@ -268,7 +322,7 @@ async function handleCompress(req, res, body) {
       overwrote: true,
       hitTarget,
       passUsed,
-    })
+    }, 'done')
 
     return json(res, 200, {
       ok: true,
@@ -283,7 +337,17 @@ async function handleCompress(req, res, body) {
     })
   } catch (e) {
     console.error('[compress] internal error:', e)
+    // Best effort: mark failed for this file if we know which it was
+    if (objectName) {
+      await updatePdfStorageRow(objectName, {
+        compressedBytes: null, ratio: null, overwrote: false, hitTarget: null, passUsed: 0,
+      }, 'failed')
+    }
     return json(res, 500, { ok: false, error: 'internal', details: String(e?.message || e) })
+  } finally {
+    // Safety cleanup in case of early exit
+    if (inPath) await unlink(inPath).catch(() => {})
+    if (bestPath && bestPath !== inPath) await unlink(bestPath).catch(() => {})
   }
 }
 
